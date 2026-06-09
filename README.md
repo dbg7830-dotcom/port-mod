@@ -61,4 +61,7 @@ gradle validateBackport
 - The Minecraft dependency is exactly `>=1.21.1 <1.21.2`.
 - The missing upstream datagen entrypoint is removed.
 - The main entrypoint classes are present.
-- Every mixin listed in `unstablegeneration.mixins.json` has a matching class 
+- Every mixin listed in `unstablegeneration.mixins.json` has a matching class file.
+- Important assets and worldgen data files are preserved.
+
+Because the original source code was not available, this repository cannot automatically prove that every Minecraft internals call from the 1.21.11 binary behaves identically on 1.21.1. If a runtime issue appears, the next step is to decompile the affected class and source-port that specific code path against 1.21.1 Yarn mappings.
