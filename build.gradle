@@ -1,0 +1,213 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.util.zip.ZipFile
+
+plugins {
+    id 'base'
+}
+
+def minecraftVersion = providers.gradleProperty('minecraft_version').get()
+def modVersion = providers.gradleProperty('mod_version').get()
+def backportArchiveBaseName = providers.gradleProperty('archives_base_name').get()
+def sourceJarName = providers.gradleProperty('source_jar').get()
+
+version = modVersion
+group = 'net.unstablegeneration'
+
+ext.originalJar = layout.projectDirectory.file(sourceJarName)
+ext.generatedResourcesDir = layout.buildDirectory.dir('generated/backportResources')
+ext.expectedMainEntrypoints = [
+        'net.unstablegeneration.UnstableGenerationMod',
+        'net.unstablegeneration.DumpDF'
+]
+
+Object unwrapBackportDensityFunctions(Object value) {
+    if (value instanceof Map) {
+        def type = value.type
+        switch (type) {
+            case 'unstablegeneration:amplified_switch':
+            case 'unstablegeneration:great_sea_switch':
+            case 'unstablegeneration:great_sea_surface_switch':
+                return unwrapBackportDensityFunctions(value.normal)
+            case 'unstablegeneration:cherry_farlands_function':
+            case 'unstablegeneration:cherry_farlands_surface_function':
+            case 'unstablegeneration:spokelands_function':
+            case 'unstablegeneration:spokelands_surface_function':
+            case 'unstablegeneration:furtherlands_function':
+            case 'unstablegeneration:smugglers_past_function':
+            case 'unstablegeneration:beyond_farlands_check':
+            case 'unstablegeneration:terraced':
+                return unwrapBackportDensityFunctions(value.input ?: value.argument ?: 0.0)
+            case 'unstablegeneration:radius_check':
+                // This custom 1.21.11 density function is not safe to decode on
+                // 1.21.1. A neutral constant keeps vanilla cave routing valid.
+                return 0.0
+            default:
+                return value.collectEntries { key, nestedValue ->
+                    [(key): unwrapBackportDensityFunctions(nestedValue)]
+                }
+        }
+    }
+
+    if (value instanceof List) {
+        return value.collect { nestedValue -> unwrapBackportDensityFunctions(nestedValue) }
+    }
+
+    return value
+}
+
+void assertNoUnstableWorldgenTypes(Object value, String path = '$') {
+    if (value instanceof Map) {
+        if (value.type instanceof String && value.type.startsWith('unstablegeneration:')) {
+            throw new GradleException("1.21.1-safe worldgen still contains incompatible custom type ${value.type} at ${path}")
+        }
+        value.each { key, nestedValue -> assertNoUnstableWorldgenTypes(nestedValue, "${path}.${key}") }
+    } else if (value instanceof List) {
+        value.eachWithIndex { nestedValue, index -> assertNoUnstableWorldgenTypes(nestedValue, "${path}[${index}]") }
+    }
+}
+
+tasks.register('patchBackportResources') {
+    inputs.file(originalJar)
+    outputs.dir(generatedResourcesDir)
+
+    doLast {
+        def outputDir = generatedResourcesDir.get().asFile
+        outputDir.mkdirs()
+
+        def zip = new ZipFile(originalJar.asFile)
+        try {
+            def metadataEntry = zip.getEntry('fabric.mod.json')
+            if (metadataEntry == null) {
+                throw new GradleException("${sourceJarName} does not contain fabric.mod.json")
+            }
+
+            def metadata = new JsonSlurper().parse(zip.getInputStream(metadataEntry))
+            metadata.version = modVersion
+            metadata.depends.minecraft = ">=${minecraftVersion} <1.21.2"
+            metadata.depends.fabricloader = '>=0.16.6'
+            metadata.depends.java = '>=21'
+            metadata.depends.'fabric-api' = '*'
+
+            // The upstream 1.21.11 jar advertises a datagen entrypoint that is not
+            // present in the jar. Removing it prevents Fabric Loader from reporting a
+            // missing optional development-only entrypoint in the backported artifact.
+            metadata.entrypoints.remove('fabric-datagen')
+
+            new File(outputDir, 'fabric.mod.json').text = JsonOutput.prettyPrint(JsonOutput.toJson(metadata)) + '\n'
+
+            def overworldPath = 'data/minecraft/worldgen/noise_settings/overworld.json'
+            def overworldEntry = zip.getEntry(overworldPath)
+            if (overworldEntry == null) {
+                throw new GradleException("${sourceJarName} does not contain ${overworldPath}")
+            }
+
+            def overworld = new JsonSlurper().parse(zip.getInputStream(overworldEntry))
+            def safeOverworld = unwrapBackportDensityFunctions(overworld)
+            assertNoUnstableWorldgenTypes(safeOverworld)
+
+            def overworldFile = new File(outputDir, overworldPath)
+            overworldFile.parentFile.mkdirs()
+            overworldFile.text = JsonOutput.prettyPrint(JsonOutput.toJson(safeOverworld)) + '\n'
+        } finally {
+            zip.close()
+        }
+    }
+}
+
+tasks.register('backportJar', Jar) {
+    dependsOn tasks.named('patchBackportResources')
+    group = 'build'
+    description = 'Builds the Fabric 1.21.1 backport jar from the upstream 1.21.11 jar.'
+
+    archiveBaseName = backportArchiveBaseName
+    archiveVersion = modVersion
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+
+    from(zipTree(originalJar)) {
+        exclude 'fabric.mod.json'
+        exclude 'data/minecraft/worldgen/noise_settings/overworld.json'
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+    }
+    from(generatedResourcesDir)
+
+    manifest {
+        attributes(
+                'Implementation-Title': 'Unstable Generation',
+                'Implementation-Version': modVersion,
+                'Backported-From-Minecraft': '1.21.11',
+                'Backported-To-Minecraft': minecraftVersion
+        )
+    }
+}
+
+tasks.register('validateBackport') {
+    dependsOn tasks.named('backportJar')
+    group = 'verification'
+    description = 'Performs structural checks on the generated backport jar.'
+
+    doLast {
+        def jarFile = tasks.named('backportJar').get().archiveFile.get().asFile
+        def zip = new ZipFile(jarFile)
+        try {
+            def metadataEntry = zip.getEntry('fabric.mod.json')
+            if (metadataEntry == null) {
+                throw new GradleException('Generated jar is missing fabric.mod.json')
+            }
+
+            def metadata = new JsonSlurper().parse(zip.getInputStream(metadataEntry))
+            if (metadata.depends.minecraft != ">=${minecraftVersion} <1.21.2") {
+                throw new GradleException("Minecraft dependency was not patched correctly: ${metadata.depends.minecraft}")
+            }
+            if (metadata.entrypoints.containsKey('fabric-datagen')) {
+                throw new GradleException('Generated jar still contains the missing fabric-datagen entrypoint')
+            }
+
+            expectedMainEntrypoints.each { className ->
+                def path = className.replace('.', '/') + '.class'
+                if (zip.getEntry(path) == null) {
+                    throw new GradleException("Generated jar is missing main entrypoint class: ${className}")
+                }
+            }
+
+            def mixinsEntry = zip.getEntry('unstablegeneration.mixins.json')
+            if (mixinsEntry == null) {
+                throw new GradleException('Generated jar is missing unstablegeneration.mixins.json')
+            }
+            def mixins = new JsonSlurper().parse(zip.getInputStream(mixinsEntry))
+            ['mixins', 'client'].each { section ->
+                (mixins[section] ?: []).each { mixinName ->
+                    def path = mixins.package.replace('.', '/') + '/' + mixinName + '.class'
+                    if (zip.getEntry(path) == null) {
+                        throw new GradleException("Generated jar is missing mixin class: ${path}")
+                    }
+                }
+            }
+
+            def overworldPath = 'data/minecraft/worldgen/noise_settings/overworld.json'
+            def overworldEntry = zip.getEntry(overworldPath)
+            if (overworldEntry == null) {
+                throw new GradleException("Generated jar is missing resource: ${overworldPath}")
+            }
+            def overworld = new JsonSlurper().parse(zip.getInputStream(overworldEntry))
+            assertNoUnstableWorldgenTypes(overworld)
+
+            ['assets/unstablegeneration/icon.png', 'data/unstablegeneration/worldgen/biome/underworld.json'].each { path ->
+                if (zip.getEntry(path) == null) {
+                    throw new GradleException("Generated jar is missing resource: ${path}")
+                }
+            }
+        } finally {
+            zip.close()
+        }
+    }
+}
+
+tasks.named('assemble') {
+    dependsOn tasks.named('backportJar')
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('validateBackport')
+}
