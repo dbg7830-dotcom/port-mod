@@ -43,6 +43,10 @@ Object unwrapBackportDensityFunctions(Object value) {
                 // 1.21.1. A neutral constant keeps vanilla cave routing valid.
                 return 0.0
             default:
+                // Remove any keys that reference unstablegeneration custom types
+                if (type instanceof String && type.startsWith('unstablegeneration:')) {
+                    return 0.0
+                }
                 return value.collectEntries { key, nestedValue ->
                     [(key): unwrapBackportDensityFunctions(nestedValue)]
                 }
@@ -87,7 +91,7 @@ tasks.register('patchBackportResources') {
             metadata.depends.minecraft = ">=${minecraftVersion} <1.21.2"
             metadata.depends.fabricloader = '>=0.16.6'
             metadata.depends.java = '>=21'
-            metadata.depends.'fabric-api' = '*'
+            metadata.depends.'fabric-api' = '>=0.116.11+1.21.1'
 
             // The upstream 1.21.11 jar advertises a datagen entrypoint that is not
             // present in the jar. Removing it prevents Fabric Loader from reporting a
